@@ -1,0 +1,160 @@
+name: TaskBoard CI/CD
+
+# test ─┐
+# sast ─┼─▶ build + Trivy gate + push (GHCR, SHA tag) ─▶ deploy test (kind + Helm) ─▶ GitOps: bump tags in values-gitops.yaml
+# sca  ─┤                                                                               (Argo CD syncs the cluster from Git)
+# secrets┘
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", "helm/taskboard/values-gitops.yaml"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    name: Test (pytest + frontend build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.12", cache: pip}
+      - name: Install backend dependencies
+        run: pip install -r requirements.txt
+        working-directory: backend
+      - name: Run backend tests
+        run: pytest -v
+        working-directory: backend
+      - uses: actions/setup-node@v7
+        with: {node-version: "22"}
+      - name: Build frontend
+        run: npm install && npm run build
+        working-directory: frontend
+
+  sast:
+    name: SAST (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.12"}
+      - run: pip install "bandit[toml]==1.9.4"
+      - name: Bandit (fail on MEDIUM+)
+        run: bandit -r backend/app --severity-level medium
+
+  sca:
+    name: SCA (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with: {python-version: "3.12"}
+      - run: pip install pip-audit
+      - name: pip-audit (fail on any known vulnerability)
+        run: pip-audit -r backend/requirements.txt
+
+  secret-scan:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with: {fetch-depth: 0}
+      - name: Gitleaks (full history)
+        run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.30.1 git /repo --redact --verbose
+
+  build-scan-push:
+    name: Build, Trivy gate, push to GHCR
+    needs: [test, sast, sca, secret-scan]
+    runs-on: ubuntu-latest
+    permissions: {contents: read, packages: write}
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
+      owner: ${{ steps.vars.outputs.owner }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: vars
+        run: |
+          echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+      - name: Build images
+        run: |
+          docker build -t ghcr.io/${{ steps.vars.outputs.owner }}/taskboard-backend:${{ steps.vars.outputs.tag }} ./backend
+          docker build -t ghcr.io/${{ steps.vars.outputs.owner }}/taskboard-frontend:${{ steps.vars.outputs.tag }} ./frontend
+      - name: Trivy gate - backend (fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ghcr.io/${{ steps.vars.outputs.owner }}/taskboard-backend:${{ steps.vars.outputs.tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Trivy gate - frontend (fixable HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ghcr.io/${{ steps.vars.outputs.owner }}/taskboard-frontend:${{ steps.vars.outputs.tag }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          skip-setup-trivy: true
+      - uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push images (commit SHA tag)
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push ghcr.io/${{ steps.vars.outputs.owner }}/taskboard-backend:${{ steps.vars.outputs.tag }}
+          docker push ghcr.io/${{ steps.vars.outputs.owner }}/taskboard-frontend:${{ steps.vars.outputs.tag }}
+
+  deploy-test:
+    name: Deploy to Kubernetes (kind) with Helm
+    needs: build-scan-push
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: helm/kind-action@v1.15.1
+      - name: helm upgrade --install
+        run: |
+          helm upgrade --install taskboard ./helm/taskboard -n taskboard --create-namespace \
+            --set backend.image=ghcr.io/${{ needs.build-scan-push.outputs.owner }}/taskboard-backend \
+            --set frontend.image=ghcr.io/${{ needs.build-scan-push.outputs.owner }}/taskboard-frontend \
+            --set backend.tag=${{ needs.build-scan-push.outputs.tag }} \
+            --set frontend.tag=${{ needs.build-scan-push.outputs.tag }} \
+            --set monitoring.serviceMonitor.enabled=false \
+            --set hpa.enabled=false --set replicaCount=1
+          kubectl rollout status deploy/taskboard-taskboard-backend -n taskboard --timeout=300s
+          kubectl rollout status deploy/taskboard-frontend -n taskboard --timeout=180s
+          kubectl get pods,svc -n taskboard
+      - name: Smoke test through the frontend (nginx -> backend -> PostgreSQL)
+        run: |
+          kubectl port-forward -n taskboard svc/taskboard-frontend 8080:80 &
+          sleep 4
+          curl -fs localhost:8080/health && echo
+          curl -fs -X POST localhost:8080/api/tasks -H 'Content-Type: application/json' -d '{"title":"CI smoke test","priority":"LOW"}' && echo
+          curl -fs localhost:8080/api/tasks/stats && echo
+
+  gitops-update:
+    name: GitOps - update image tags in Git
+    needs: [build-scan-push, deploy-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions: {contents: write}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Bump tags in helm/taskboard/values-gitops.yaml
+        run: |
+          TAG=${{ needs.build-scan-push.outputs.tag }}
+          sed -i -E "s/^(  tag: ).*/\1${TAG}/" helm/taskboard/values-gitops.yaml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "gitops: deploy ${TAG} [skip ci]" || echo "no change"
+          git push
