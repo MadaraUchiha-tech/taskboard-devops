@@ -2,10 +2,10 @@
 # after a commit passes tests, security scans and the Kubernetes deploy test.
 backend:
   image: ghcr.io/madarauchiha-tech/taskboard-backend
-  tag: latest
+  tag: ae3b575
 frontend:
   image: ghcr.io/madarauchiha-tech/taskboard-frontend
-  tag: latest
+  tag: ae3b575
 replicaCount: 2
 ingress:
   enabled: true
